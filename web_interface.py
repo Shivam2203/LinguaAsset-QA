@@ -16,8 +16,23 @@ import plotly.express as px
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 🔥 IMPORTANT: Load .env FIRST before any other imports that need API key
+from dotenv import load_dotenv
+load_dotenv()  # This loads the .env file
+
+# Verify API key is loaded (optional debug)
+api_key = os.getenv("GOOGLE_API_KEY")
+if not api_key:
+    st.error("❌ GOOGLE_API_KEY not found in .env file!")
+    st.info(f"Current directory: {os.getcwd()}")
+    st.stop()
+else:
+    # Show success (you can comment this out later)
+    st.sidebar.success(f"✅ API key loaded: {api_key[:10]}...")
+
+# Now import your modules
 import config
-from qa_engine_multilang import get_qa_engine, answer_question
+from qa_engine import get_qa_engine, answer_question
 from language_handler import language_processor
 
 logger = logging.getLogger(__name__)

@@ -143,3 +143,24 @@ ENABLE_TRANSLATION_CACHE = True
 # Use HuggingFace embeddings (completely free!)
 USE_HUGGINGFACE_EMBEDDINGS = True  # Set to True to use free embeddings
 HUGGINGFACE_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+# ==================== DOCUMENT PROCESSING LIMITS ====================
+# Content filtering
+MIN_CONTENT_LENGTH = 10        # Minimum content length to keep
+MAX_CONTENT_LENGTH = 5000      # Maximum content length per chunk
+MIN_TEXT_LENGTH = 5            # Minimum text length
+
+# Excel/CSV processing limits
+MAX_EXCEL_ROWS = 50            # Maximum rows per Excel sheet/CSV file
+MAX_EXCEL_SHEETS = 5           # Maximum sheets per Excel file
+MAX_EXCEL_DOCS = 50            # Maximum documents per Excel file
+MAX_SECTION_LENGTH = 50        # Maximum section title length
+MAX_SECTION_CONTENT = 5000     # Maximum section content length
+
+# Batch processing
+BATCH_SIZE = 5                 # Documents per batch
+BATCH_DELAY = 0.5              # Delay between batches (seconds)
+SINGLE_DOC_DELAY = 0.2         # Delay between single documents
+
+# Text separators for chunking
+TEXT_SEPARATORS = ["\n\n", "\n", ". ", "; ", ", ", " ", ""]

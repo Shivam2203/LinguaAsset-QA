@@ -1,6 +1,6 @@
 """
 Data Processor - Handles document loading, chunking, and vectorization
-Updated with correct LangChain imports
+Updated with correct LangChain imports and CSV support
 """
 
 import os
@@ -14,10 +14,9 @@ from typing import List, Dict, Any, Optional, Generator
 import logging
 
 # Updated imports for newer LangChain versions
-# Updated imports for LangChain components
 from langchain_core.documents import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter  # Fixed import
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from unstructured.partition.docx import partition_docx
 from tqdm import tqdm
@@ -57,6 +56,76 @@ class DocumentProcessor:
         except Exception as e:
             logger.error(f"❌ Embeddings failed: {e}")
             return False
+    
+    def process_csv_file(self, file_path: Path) -> List[Document]:
+        """
+        Process CSV file and convert to documents
+        
+        Args:
+            file_path: Path to CSV file
+        
+        Returns:
+            List of Document objects
+        """
+        documents = []
+        file_name = file_path.name
+        
+        try:
+            # Read CSV file
+            df = pd.read_csv(file_path)
+            
+            if df.empty:
+                logger.warning(f"  CSV file {file_name} is empty")
+                return documents
+            
+            logger.info(f"  Processing CSV: {len(df)} rows, {len(df.columns)} columns")
+            
+            # Create summary document
+            summary = f"""Source: {file_name}
+Total rows: {len(df)}
+Total columns: {len(df.columns)}
+Columns: {', '.join(df.columns.tolist()[:10])}"""
+            
+            doc = Document(
+                page_content=summary,
+                metadata={
+                    "source": file_name,
+                    "type": "csv_summary",
+                    "rows": len(df),
+                    "columns": len(df.columns)
+                }
+            )
+            documents.append(doc)
+            
+            # Process rows (limit to MAX_EXCEL_ROWS)
+            rows_processed = 0
+            for idx, row in df.head(config.MAX_EXCEL_ROWS).iterrows():
+                row_items = []
+                for col, value in row.items():
+                    if pd.notna(value) and str(value).strip():
+                        value_str = str(value)[:100]
+                        row_items.append(f"{col}: {value_str}")
+                
+                if row_items:
+                    row_text = f"Row {idx+1}: " + ", ".join(row_items[:10])
+                    
+                    doc = Document(
+                        page_content=row_text,
+                        metadata={
+                            "source": file_name,
+                            "type": "csv_row",
+                            "row": int(idx)
+                        }
+                    )
+                    documents.append(doc)
+                    rows_processed += 1
+            
+            logger.info(f"  ✅ Processed {rows_processed} rows from {file_name}")
+            return documents
+            
+        except Exception as e:
+            logger.error(f"Error processing CSV file {file_name}: {e}")
+            return documents
     
     def process_excel_file(self, file_path: Path) -> List[Document]:
         """
@@ -232,6 +301,8 @@ Columns: {', '.join(df.columns.tolist()[:10])}"""
                 docs = self.process_excel_file(file_path)
             elif ext == '.docx':
                 docs = self.process_word_file(file_path)
+            elif ext == '.csv':  # Added CSV support
+                docs = self.process_csv_file(file_path)
             else:
                 logger.warning(f"Unsupported file type: {ext}")
                 return []
@@ -350,9 +421,9 @@ Columns: {', '.join(df.columns.tolist()[:10])}"""
             'processing_time': 0
         }
         
-        # Find all supported files
+        # Find all supported files - INCLUDING CSV!
         data_files = []
-        for ext in ['.xlsx', '.xls', '.docx']:
+        for ext in ['.xlsx', '.xls', '.docx', '.csv']:  # Added .csv
             data_files.extend(Path(config.TRAINING_DATA_DIR).glob(f"*{ext}"))
         
         # Filter temporary files
