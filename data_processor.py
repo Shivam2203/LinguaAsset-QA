@@ -1,26 +1,33 @@
 """
-Multi-Language Data Processor - Handles documents in multiple languages
+Data Processor - Handles document loading, chunking, and vectorization
+Updated with correct LangChain imports
 """
 
 import os
 import pandas as pd
-import logging
-from pathlib import Path
-from typing import List, Dict, Any, Optional
+import json
+import time
+import hashlib
 from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Generator
+import logging
 
-from langchain.schema import Document
+# Updated imports for newer LangChain versions
+from langchain_core.documents import Document  # Changed from langchain.schema
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
 from unstructured.partition.docx import partition_docx
+from tqdm import tqdm
 
 import config
-from language_handler import language_processor
 
 logger = logging.getLogger(__name__)
 
 
-class MultiLangDocumentProcessor:
-    """Process documents in multiple languages"""
+class DocumentProcessor:
+    """Enhanced document processor with progress tracking and validation"""
     
     def __init__(self):
         self.stats = {
@@ -28,24 +35,38 @@ class MultiLangDocumentProcessor:
             'processed_files': 0,
             'failed_files': 0,
             'total_chunks': 0,
-            'languages_detected': {}
+            'skipped_chunks': 0,
+            'processing_time': 0
         }
+        
+        # Initialize embeddings model (using free HuggingFace)
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
     
-    def detect_document_language(self, text: str) -> str:
-        """Detect language of document content"""
-        if not text or len(text) < 50:
-            return 'unknown'
-        
-        # Sample first 1000 characters
-        sample = text[:1000]
-        lang, confidence = language_processor.detector.detect_language(sample)
-        
-        if confidence >= 0.5:
-            return lang
-        return 'unknown'
+    def test_connection(self) -> bool:
+        """Test if embeddings are working"""
+        try:
+            logger.info("Testing embeddings...")
+            result = self.embeddings.embed_query("test connection")
+            logger.info("✅ Embeddings working")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Embeddings failed: {e}")
+            return False
     
     def process_excel_file(self, file_path: Path) -> List[Document]:
-        """Process Excel file with language detection"""
+        """
+        Process Excel file and convert to documents
+        
+        Args:
+            file_path: Path to Excel file
+        
+        Returns:
+            List of Document objects
+        """
         documents = []
         file_name = file_path.name
         
@@ -53,30 +74,37 @@ class MultiLangDocumentProcessor:
             excel_file = pd.ExcelFile(file_path)
             sheet_names = excel_file.sheet_names[:config.MAX_EXCEL_SHEETS]
             
+            logger.info(f"  Processing {len(sheet_names)} sheets from {file_name}")
+            
             for sheet_name in sheet_names:
                 try:
                     df = pd.read_excel(file_path, sheet_name=sheet_name)
                     
                     if df.empty:
+                        logger.debug(f"  Sheet {sheet_name} is empty, skipping")
                         continue
                     
-                    # Convert dataframe to text for language detection
-                    sample_text = " ".join(df.iloc[0].astype(str).tolist())
-                    doc_lang = self.detect_document_language(sample_text)
+                    # Convert datetime columns
+                    for col in df.columns:
+                        if df[col].dtype in ['datetime64[ns]', 'object']:
+                            if df[col].apply(lambda x: isinstance(x, (datetime, pd.Timestamp))).any():
+                                df[col] = df[col].apply(
+                                    lambda x: x.isoformat() if isinstance(x, (datetime, pd.Timestamp)) else x
+                                )
                     
-                    # Update language stats
-                    self.stats['languages_detected'][doc_lang] = \
-                        self.stats['languages_detected'].get(doc_lang, 0) + 1
+                    # Create table summary
+                    summary = f"""Source: {file_name}
+Sheet: {sheet_name}
+Total rows: {len(df)}
+Total columns: {len(df.columns)}
+Columns: {', '.join(df.columns.tolist()[:10])}"""
                     
-                    # Create document with language metadata
                     doc = Document(
-                        page_content=f"Excel File: {file_name}\nSheet: {sheet_name}\n"
-                                   f"Rows: {len(df)}\nColumns: {len(df.columns)}",
+                        page_content=summary,
                         metadata={
                             "source": file_name,
                             "sheet": sheet_name,
-                            "type": "excel",
-                            "language": doc_lang,
+                            "type": "excel_summary",
                             "rows": len(df),
                             "columns": len(df.columns)
                         }
@@ -84,16 +112,16 @@ class MultiLangDocumentProcessor:
                     documents.append(doc)
                     
                     # Process rows
+                    rows_processed = 0
                     for idx, row in df.head(config.MAX_EXCEL_ROWS).iterrows():
-                        row_text = f"Sheet[{sheet_name}] Row {idx+1}: "
                         row_items = []
-                        
                         for col, value in row.items():
                             if pd.notna(value) and str(value).strip():
-                                row_items.append(f"{col}: {value}")
+                                value_str = str(value)[:100]
+                                row_items.append(f"{col}: {value_str}")
                         
                         if row_items:
-                            row_text += " | ".join(row_items[:10])
+                            row_text = f"Sheet[{sheet_name}] Row {idx+1}: " + ", ".join(row_items[:10])
                             
                             doc = Document(
                                 page_content=row_text,
@@ -101,92 +129,233 @@ class MultiLangDocumentProcessor:
                                     "source": file_name,
                                     "sheet": sheet_name,
                                     "type": "excel_row",
-                                    "language": doc_lang,
                                     "row": int(idx)
                                 }
                             )
                             documents.append(doc)
+                            rows_processed += 1
+                    
+                    logger.info(f"    Sheet {sheet_name}: {rows_processed} rows processed")
                     
                 except Exception as e:
-                    logger.error(f"Error processing sheet {sheet_name}: {e}")
+                    logger.error(f"    Error processing sheet {sheet_name}: {e}")
                     continue
-            
-            self.stats['processed_files'] += 1
+                
+                # Small delay to avoid overwhelming
+                time.sleep(0.1)
             
         except Exception as e:
             logger.error(f"Error processing Excel file {file_name}: {e}")
-            self.stats['failed_files'] += 1
         
         return documents
     
     def process_word_file(self, file_path: Path) -> List[Document]:
-        """Process Word file with language detection"""
+        """
+        Process Word file and convert to documents
+        
+        Args:
+            file_path: Path to Word file
+        
+        Returns:
+            List of Document objects
+        """
         documents = []
         file_name = file_path.name
         
         try:
-            # Extract text
+            logger.info(f"  Processing Word file: {file_name}")
+            
+            # Use unstructured for better parsing
             elements = partition_docx(filename=str(file_path), strategy="auto")
             
-            # Combine text for language detection
-            full_text = "\n".join([str(el) for el in elements if str(el).strip()])
+            # Extract text from elements
+            full_text = []
+            
+            for element in elements:
+                text = str(element).strip()
+                if not text or len(text) < config.MIN_TEXT_LENGTH:
+                    continue
+                
+                full_text.append(text)
             
             if not full_text:
+                logger.warning(f"  No text extracted from {file_name}")
                 return documents
             
-            # Detect document language
-            doc_lang = self.detect_document_language(full_text)
-            
-            # Update stats
-            self.stats['languages_detected'][doc_lang] = \
-                self.stats['languages_detected'].get(doc_lang, 0) + 1
+            # Combine all text
+            combined_text = "\n\n".join(full_text)
             
             # Split into chunks
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=config.TEXT_CHUNK_SIZE,
                 chunk_overlap=config.TEXT_CHUNK_OVERLAP,
-                separators=config.TEXT_SEPARATORS
+                separators=config.TEXT_SEPARATORS,
+                length_function=len
             )
             
-            chunks = text_splitter.create_documents([full_text])
+            chunks = text_splitter.create_documents([combined_text[:config.MAX_TEXT_LENGTH]])
             
-            # Add metadata
-            for i, chunk in enumerate(chunks):
+            # Add metadata to chunks
+            for i, chunk in enumerate(chunks[:config.MAX_CHUNK_COUNT]):
                 chunk.metadata = {
                     "source": file_name,
                     "type": "word_chunk",
-                    "language": doc_lang,
                     "chunk": i,
-                    "total_chunks": len(chunks)
+                    "total_chunks": min(len(chunks), config.MAX_CHUNK_COUNT)
                 }
                 documents.append(chunk)
             
-            self.stats['processed_files'] += 1
-            logger.info(f"Processed {file_name}: {len(chunks)} chunks, language: {doc_lang}")
+            logger.info(f"  Created {len(documents)} chunks from {file_name}")
             
         except Exception as e:
             logger.error(f"Error processing Word file {file_name}: {e}")
-            self.stats['failed_files'] += 1
         
         return documents
     
+    def process_file(self, file_path: Path) -> List[Document]:
+        """
+        Process a single file based on its extension
+        
+        Args:
+            file_path: Path to file
+        
+        Returns:
+            List of Document objects
+        """
+        self.stats['total_files'] += 1
+        
+        ext = file_path.suffix.lower()
+        
+        try:
+            if ext in ['.xlsx', '.xls']:
+                docs = self.process_excel_file(file_path)
+            elif ext == '.docx':
+                docs = self.process_word_file(file_path)
+            else:
+                logger.warning(f"Unsupported file type: {ext}")
+                return []
+            
+            self.stats['processed_files'] += 1
+            self.stats['total_chunks'] += len(docs)
+            
+            return docs
+            
+        except Exception as e:
+            logger.error(f"Failed to process {file_path.name}: {e}")
+            self.stats['failed_files'] += 1
+            return []
+    
+    def validate_document(self, doc: Document) -> bool:
+        """
+        Validate document before storing
+        
+        Args:
+            doc: Document to validate
+        
+        Returns:
+            True if valid, False otherwise
+        """
+        content = doc.page_content.strip()
+        
+        # Check length
+        if len(content) < config.MIN_CONTENT_LENGTH:
+            self.stats['skipped_chunks'] += 1
+            return False
+        
+        if len(content) > config.MAX_CONTENT_LENGTH:
+            # Truncate instead of skip
+            doc.page_content = content[:config.MAX_CONTENT_LENGTH]
+        
+        # Check for garbage content (too many special characters)
+        special_chars = sum(not c.isalnum() and not c.isspace() for c in content)
+        if special_chars > len(content) * 0.3:  # More than 30% special chars
+            self.stats['skipped_chunks'] += 1
+            return False
+        
+        return True
+    
+    def store_documents(self, documents: List[Document]) -> int:
+        """
+        Store documents in vector database with batching
+        
+        Args:
+            documents: List of documents to store
+        
+        Returns:
+            Number of successfully stored documents
+        """
+        if not documents:
+            return 0
+        
+        try:
+            # Initialize vector database
+            vector_db = Chroma(
+                persist_directory=config.DB_DIRECTORY,
+                embedding_function=self.embeddings,
+                collection_name=config.COLLECTION_NAME
+            )
+            
+            # Store in batches
+            success_count = 0
+            batch_size = config.BATCH_SIZE
+            
+            for i in range(0, len(documents), batch_size):
+                batch = documents[i:i+batch_size]
+                
+                try:
+                    # Add batch to database
+                    vector_db.add_documents(batch)
+                    success_count += len(batch)
+                    
+                    logger.debug(f"  Stored batch {i//batch_size + 1}: {len(batch)} documents")
+                    
+                    # Small delay between batches
+                    time.sleep(config.BATCH_DELAY)
+                    
+                except Exception as e:
+                    logger.error(f"  Batch storage failed: {e}")
+                    
+                    # Try individual storage
+                    for doc in batch:
+                        try:
+                            vector_db.add_documents([doc])
+                            success_count += 1
+                            time.sleep(config.SINGLE_DOC_DELAY)
+                        except Exception as e2:
+                            logger.error(f"    Individual document storage failed: {e2}")
+            
+            return success_count
+            
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+            return 0
+    
     def process_all_files(self) -> Dict[str, Any]:
-        """Process all files in training directory"""
+        """
+        Process all files in training data directory
+        
+        Returns:
+            Statistics dictionary
+        """
+        start_time = time.time()
+        
+        # Reset stats
         self.stats = {
             'total_files': 0,
             'processed_files': 0,
             'failed_files': 0,
             'total_chunks': 0,
-            'languages_detected': {}
+            'skipped_chunks': 0,
+            'processing_time': 0
         }
         
-        # Find all files
+        # Find all supported files
         data_files = []
         for ext in ['.xlsx', '.xls', '.docx']:
             data_files.extend(Path(config.TRAINING_DATA_DIR).glob(f"*{ext}"))
         
+        # Filter temporary files
         data_files = [f for f in data_files if not f.name.startswith('~$')]
-        self.stats['total_files'] = len(data_files)
         
         if not data_files:
             logger.warning("No files found to process")
@@ -194,61 +363,68 @@ class MultiLangDocumentProcessor:
         
         logger.info(f"Found {len(data_files)} files to process")
         
+        # Process each file
         all_documents = []
         
-        for file_path in data_files:
-            logger.info(f"Processing: {file_path.name}")
+        for file_path in tqdm(data_files, desc="Processing files"):
+            logger.info(f"\n📄 Processing: {file_path.name}")
             
-            if file_path.suffix.lower() in ['.xlsx', '.xls']:
-                docs = self.process_excel_file(file_path)
-            elif file_path.suffix.lower() == '.docx':
-                docs = self.process_word_file(file_path)
-            else:
-                continue
+            docs = self.process_file(file_path)
             
-            all_documents.extend(docs)
-            self.stats['total_chunks'] += len(docs)
+            # Validate documents
+            valid_docs = [doc for doc in docs if self.validate_document(doc)]
+            
+            if len(valid_docs) < len(docs):
+                logger.info(f"  Filtered {len(docs) - len(valid_docs)} invalid documents")
+            
+            all_documents.extend(valid_docs)
+            
+            # Small delay between files
+            time.sleep(1)
         
-        # Store in vector database
-        if all_documents:
-            self._store_documents(all_documents)
+        if not all_documents:
+            logger.warning("No valid documents to store")
+            return self.stats
         
-        # Print language statistics
-        logger.info("\n📊 Language Distribution:")
-        for lang, count in self.stats['languages_detected'].items():
-            lang_name = language_processor.detector.get_language_name(lang)
-            logger.info(f"  {lang_name}: {count} files")
+        logger.info(f"\n💾 Storing {len(all_documents)} documents in vector database...")
+        
+        # Store documents
+        stored = self.store_documents(all_documents)
+        
+        # Update stats
+        self.stats['processing_time'] = time.time() - start_time
+        
+        logger.info(f"\n✅ Processing complete!")
+        logger.info(f"   Files processed: {self.stats['processed_files']}/{self.stats['total_files']}")
+        logger.info(f"   Documents stored: {stored}")
+        logger.info(f"   Time taken: {self.stats['processing_time']:.2f}s")
         
         return self.stats
-    
-    def _store_documents(self, documents: List[Document]):
-        """Store documents in vector database"""
-        from langchain_community.embeddings import DashScopeEmbeddings
-        from langchain_chroma import Chroma
-        
-        api_key = os.getenv(config.API_KEY_NAME)
-        embeddings = DashScopeEmbeddings(
-            model=config.EMBEDDING_MODEL_NAME,
-            dashscope_api_key=api_key
-        )
-        
-        vector_db = Chroma(
-            persist_directory=config.DB_DIRECTORY,
-            embedding_function=embeddings,
-            collection_name=config.COLLECTION_NAME
-        )
-        
-        # Store in batches
-        batch_size = config.BATCH_SIZE
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i+batch_size]
-            vector_db.add_documents(batch)
-            logger.info(f"Stored batch {i//batch_size + 1}: {len(batch)} documents")
 
 
-# Convenience function
 def process_training_data() -> bool:
-    """Process all training data"""
-    processor = MultiLangDocumentProcessor()
+    """
+    Main function to process all training data
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    processor = DocumentProcessor()
+    
+    # Test connection first
+    if not processor.test_connection():
+        logger.error("Embeddings test failed")
+        return False
+    
+    # Process files
     stats = processor.process_all_files()
+    
     return stats['processed_files'] > 0
+
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    success = process_training_data()
+    print(f"\nProcessing {'successful' if success else 'failed'}")
