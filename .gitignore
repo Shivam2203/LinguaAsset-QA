@@ -1,0 +1,4 @@
+venv_multilang/
+__pycache__/
+.env
+*.pyc
