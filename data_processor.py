@@ -14,9 +14,10 @@ from typing import List, Dict, Any, Optional, Generator
 import logging
 
 # Updated imports for newer LangChain versions
-from langchain_core.documents import Document  # Changed from langchain.schema
+# Updated imports for LangChain components
+from langchain_core.documents import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter  # Fixed import
 from langchain_chroma import Chroma
 from unstructured.partition.docx import partition_docx
 from tqdm import tqdm
